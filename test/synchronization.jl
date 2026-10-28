@@ -68,6 +68,24 @@ end
         @test @allocated(fast_wait(op)) == 0
     end
 
+    # The worker path must reuse its synchronization storage as well as the
+    # polling path. Bits arguments and return values must not be boxed by
+    # the handoff; vary the input to catch stale pooled payloads.
+    @testset "worker waits with bits payloads allocate nothing" begin
+        worker_value(x::NTuple{4,UInt64}) = x[1] + x[2] + x[3] + x[4]
+        function bits_worker_wait(x)
+            return cooperative_wait(worker_value, x; spin=false)
+        end
+        for i in UInt64(1):UInt64(100)
+            input = (i, i+1, i+2, i+3)
+            @test bits_worker_wait(input) == Some(4i + 6)
+        end
+        if !isdefined(Base, :CANCEL_TOKEN)
+            input = (UInt64(101), UInt64(102), UInt64(103), UInt64(104))
+            @test @allocated(bits_worker_wait(input)) == 0
+        end
+    end
+
     # other tasks on this thread keep running while waiting on a worker
     for polled in (false, true)
         op = complete_after!(Operation(), 30)   # in case the thread is blocked

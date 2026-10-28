@@ -65,21 +65,65 @@ end
 # deadlock if what the finalizer waits for depends on that. finalizers that become pending
 # on a worker thread (e.g., when it triggers a collection) run on another thread instead.
 
-mutable struct WaitRequest
-    const wait::Any
-    const obj::Any
-    const done::Base.Event
-    result::Any
-    failed::Bool
-    submitted::Bool     # whether a worker has been handed the request
+abstract type AbstractWaitRequest end
 
-    WaitRequest(wait, obj) = new(wait, obj, Base.Event(), nothing, false, false)
+mutable struct WaitRequest{F,O,R} <: AbstractWaitRequest
+    wait::Union{Nothing,F}
+    obj::Union{Nothing,O}
+    const done::Base.Event
+    result::Union{Nothing,R}
+    error::Any
+    failed::Bool
+    submitted::Bool
+end
+
+# A request belongs to one waiting task until it has observed completion.
+# Keeping the input and result types avoids boxing bits arguments/results at
+# the caller/worker boundary, as well as reusing the event and condition.
+const wait_request_pools = IdDict{DataType,Any}()
+const wait_request_pool_lock = ReentrantLock()
+
+function acquire_wait_request(wait::F, obj::O) where {F,O}
+    R = Core.Compiler.return_type(wait, Tuple{O})
+    return acquire_wait_request(WaitRequest{F,O,R}, wait, obj)
+end
+
+function acquire_wait_request(::Type{T}, wait, obj) where {T<:WaitRequest}
+    request = @lock wait_request_pool_lock begin
+        requests = get!(() -> T[], wait_request_pools, T)::Vector{T}
+        isempty(requests) ? T(nothing, nothing, Base.Event(), nothing, nothing, false, false) : pop!(requests)
+    end
+    request.wait = wait
+    request.obj = obj
+    reset(request.done)
+    return request
+end
+
+function release_wait_request(request::T) where {T<:WaitRequest}
+    request.wait = nothing
+    request.obj = nothing
+    request.result = nothing
+    request.error = nothing
+    request.failed = false
+    request.submitted = false
+    @lock wait_request_pool_lock push!(wait_request_pools[T]::Vector{T}, request)
+    return nothing
+end
+
+function execute_wait!(request::WaitRequest{F,O}) where {F,O}
+    try
+        request.result = (request.wait::F)(request.obj::O)
+    catch err
+        request.error = err
+        request.failed = true
+    end
+    return nothing
 end
 
 mutable struct WaitWorker
     const work::Base.Event      # autoreset
     const overflow::Bool
-    request::Union{Nothing,WaitRequest}
+    request::Union{Nothing,AbstractWaitRequest}
 
     WaitWorker(overflow::Bool) = new(Base.Event(true), overflow, nothing)
 end
@@ -103,16 +147,11 @@ function wait_worker_loop(data::Ptr{Cvoid})
     ccall(:jl_gc_disable_finalizers_internal, Cvoid, ())
     while true
         Base.wait(worker.work)
-        request = worker.request::WaitRequest
+        request = worker.request::AbstractWaitRequest
         worker.request = nothing
-
-        try
-            # the worker was started in an older world
-            request.result = Base.invokelatest(request.wait, request.obj)
-        catch err
-            request.result = err
-            request.failed = true
-        end
+        # Enter the latest world once with the existing request object. Calling
+        # the typed callback here also avoids boxing its result for invokelatest.
+        Base.invokelatest(execute_wait!, request)
 
         # become available before waking the caller, so that it finds this worker when it
         # immediately waits again
@@ -152,7 +191,7 @@ end
 
 # hand a request to a worker, returning whether one was available. that is always the case
 # for objects that cannot be polled, which use an overflow worker when all others are busy.
-function submit!(request::WaitRequest, pollable::Bool)
+function submit!(request::AbstractWaitRequest, pollable::Bool)
     @lock wait_worker_lock begin
         # handing over the request must not be interrupted halfway, or the worker would be
         # lost
@@ -323,7 +362,7 @@ end
 
 # returns whether `obj` completed while polling for a worker to become available. when
 # resuming an interrupted wait, keeps waiting for the submitted request.
-function wait_cooperatively(request::WaitRequest, obj, isdone::D) where {D}
+function wait_cooperatively(request::AbstractWaitRequest, obj, isdone::D) where {D}
     while !request.submitted && !submit!(request, isdone !== nothing)
         # all workers are busy: poll the object, periodically checking for a worker
         t0 = time_ns()
@@ -458,12 +497,21 @@ function cooperative_wait(wait::W, obj; subscribe::S=nothing, isdone::D=nothing,
 
     # slow path: wait for a completion notification, or hand the wait to a worker thread
     if subscribe === nothing
-        request = WaitRequest(wait, obj)
-        slow_wait = () -> wait_cooperatively(request, obj, isdone)
-        polled = cancellable ? slow_wait() : wait_uninterrupted(slow_wait, interrupt)
-        polled && return nothing
-        request.failed && throw(request.result)
-        return Some(request.result)
+        request = acquire_wait_request(wait, obj)
+        completed = false
+        try
+            slow_wait = () -> wait_cooperatively(request, obj, isdone)
+            polled = cancellable ? slow_wait() : wait_uninterrupted(slow_wait, interrupt)
+            completed = true
+            polled && return nothing
+            request.failed && throw(request.error)
+            return Some(request.result)
+        finally
+            # An interrupted cancellable wait can leave a worker using this
+            # request. Never recycle it until the caller observed completion.
+            # Abandoned requests remain rooted by their worker, then collect.
+            completed && uninterruptible(() -> release_wait_request(request))
+        end
     else
         c = acquire_completion()
         try
